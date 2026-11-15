@@ -16,7 +16,7 @@
   #status { margin-left: auto; color: #bbb; }
   #status.err { color: #ff8a8a; }
   #status.ok { color: #8fdc8f; }
-  #game { flex: 1; min-height: 0; position: relative; }
+  #game { flex: 1; min-height: 0; position: relative; display: flex; align-items: center; justify-content: center; background: #000; }
   #picker { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; padding: 16px; }
   #picker[hidden] { display: none; }
   #picker .box { max-width: 420px; text-align: center; background: #1b1b1b; border: 1px solid #333; border-radius: 10px; padding: 24px; }
@@ -28,7 +28,7 @@
 <script>
   window.RufflePlayer = window.RufflePlayer || {};
   window.RufflePlayer.config = { autoplay: "on", unmuteOverlay: "hidden", splashScreen: false, letterbox: "on",
-    contextMenu: "rightClickOnly", allowScriptAccess: true };
+    contextMenu: "rightClickOnly", allowScriptAccess: true, scale: "showAll", forceScale: true };
 </script>
 <script src="ruffle/ruffle.js"></script>
 <script src="net.js"></script>
@@ -96,6 +96,16 @@
   }
 
   var player = null, fromUser = false, readyTimer = null;
+  // keep the original 650 x 450 shape whatever the window or device
+  var RATIO = 650 / 450;
+  function fit() {
+    if (!player) return;
+    var g = $("game"), w = g.clientWidth, h = g.clientHeight;
+    if (w / h > RATIO) w = h * RATIO; else h = w / RATIO;
+    player.style.width = Math.floor(w) + "px"; player.style.height = Math.floor(h) + "px";
+  }
+  window.addEventListener("resize", fit);
+  if (window.ResizeObserver) new ResizeObserver(fit).observe($("game"));
   function showPicker(err) {
     $("picker").hidden = false;
     if (player) player.style.visibility = "hidden";
@@ -110,9 +120,9 @@
     status("게임을 불러오는 중...");
     if (!player) {
       player = window.RufflePlayer.newest().createPlayer();
-      player.style.width = "100%"; player.style.height = "100%";
       $("game").appendChild(player);
       window.player = player;
+      fit();
       // a valid SWF that never says "ready" is not the 2-player mod
       player.addEventListener("loadeddata", function () {
         clearTimeout(readyTimer);
