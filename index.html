@@ -58,12 +58,14 @@
 (function () {
   var q = new URLSearchParams(location.search);
   var BUNDLED = "age-of-war-online.swf";   // present in the local folder, absent on the web site
-  // connection method (see net.js): ?net=webrtc|relay|local, else last choice, else webrtc.
+  // connection method (see net.js): ?net=auto|webrtc|mqtt|local|relay, else last choice, else auto.
   // The relay lives in serve.py, so it is offered only when the page comes from serve.py (has a port).
-  var KINDS = AOWNet.kinds().filter(function (k) { return k !== "relay" || location.port; });
+  var ORDER = ["auto", "webrtc", "mqtt", "local", "relay"];
+  var KINDS = AOWNet.kinds().filter(function (k) { return k !== "relay" || location.port; })
+    .sort(function (a, b) { return (ORDER.indexOf(a) + 99) % 99 - (ORDER.indexOf(b) + 99) % 99; });
   var KIND = q.get("net");
-  try { KIND = KIND || localStorage.getItem("aow-net"); } catch (e) {}
-  if (KINDS.indexOf(KIND) < 0) KIND = "webrtc";
+  try { KIND = KIND || localStorage.getItem("aow-net2"); } catch (e) {}
+  if (KINDS.indexOf(KIND) < 0) KIND = "auto";
   var $ = function (id) { return document.getElementById(id); };
   var status = function (t, cls) { var s = $("status"); s.textContent = t; s.className = cls || ""; };
 
@@ -168,28 +170,53 @@
     playing = true;
     $("again").hidden = true;
     var r = player.aowStart(role);
-    status(role === "H" ? "게임 시작 (방장)" : "게임 시작 (참가자)", "ok");
+    var path = net && net.path ? net.path() : null;
+    status((role === "H" ? "게임 시작 (방장)" : "게임 시작 (참가자)") +
+           (path === "direct" ? " · 직접 연결" : path === "relay" ? " · 인터넷 중계" : ""), "ok");
     player.focus();
     return r;
   }
 
+  var started = false, helloTimer = null, giveUpTimer = null;
   function onLobby(t) {
-    if (t === "hello" && role === "H") { net.send("Lstart"); startGame(); }
-    else if (t === "start" && role === "G") { startGame(); }
+    if (t === "hello" && role === "H") { if (!playing) { net.send("Lstart"); startGame(); } }
+    else if (t === "start" && role === "G") { started = true; clearInterval(helloTimer); clearTimeout(giveUpTimer); startGame(); }
     else if (t === "bye") { status("상대가 나갔습니다.", "err"); playing = false; }
+  }
+  function unlock() {
+    $("host").disabled = $("join").disabled = $("code").disabled = $("kind").disabled = $("pick").disabled = false;
   }
 
   function connect(asRole, code) {
     if (!swfReady) { status(player ? "아직 게임을 불러오는 중입니다." : "먼저 게임 파일을 선택하세요.", "err"); return; }
     if (net) net.close();
-    role = asRole; room = code;
+    role = asRole; room = code; started = false;
+    clearInterval(helloTimer); clearTimeout(giveUpTimer);
     $("host").disabled = $("join").disabled = true; $("code").disabled = true; $("kind").disabled = true;
     $("pick").disabled = true;
+    if (role === "H") status("방 코드: " + room + "  — 상대가 참가하기를 기다리는 중...", "ok");
+    else {
+      status("방 " + room + " 에 연결하는 중...");
+      // guest: give up (and let the player try again) if the game has not started in time
+      giveUpTimer = setTimeout(function () {
+        if (started) return;
+        clearInterval(helloTimer);
+        if (net) { net.close(); net = null; }
+        status("방 " + room + " 에 연결하지 못했습니다. 방 코드를 확인하고 다시 참가해 보세요.", "err");
+        unlock();
+      }, 30000);
+    }
     net = AOWNet.create(KIND, room, role, {
       onOpen: function () {
         lastSeen = Date.now();
         if (role === "H") status("방 코드: " + room + "  — 상대가 참가하기를 기다리는 중...", "ok");
-        else { status("방 " + room + " 에 참가하는 중..."); net.send("Lhello"); }
+        else {
+          status("방 " + room + " 에 참가하는 중...");
+          // repeat until the host answers (it may still be getting ready)
+          net.send("Lhello");
+          clearInterval(helloTimer);
+          helloTimer = setInterval(function () { if (!started && net) net.send("Lhello"); }, 2000);
+        }
         clearInterval(pingTimer);
         pingTimer = setInterval(function () {
           net.send("Lping");
@@ -218,7 +245,7 @@
   });
   $("kind").onchange = function () {
     KIND = this.value;
-    try { localStorage.setItem("aow-net", KIND); } catch (e) {}
+    try { localStorage.setItem("aow-net2", KIND); } catch (e) {}
   };
   $("host").onclick = function () { var c = newCode(); $("code").value = c; connect("H", c); };
   $("join").onclick = function () {
