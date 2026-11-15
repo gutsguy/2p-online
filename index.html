@@ -32,6 +32,7 @@
 </script>
 <script src="ruffle/ruffle.js"></script>
 <script src="net.js"></script>
+<script src="stage.js"></script>
 </head>
 <body>
 <div id="wrap">
@@ -95,43 +96,6 @@
     return b.length === 3 && (b[0] === 0x46 || b[0] === 0x43 || b[0] === 0x5A) && b[1] === 0x57 && b[2] === 0x53;
   }
 
-  // The local 2-player file (age-of-war-2p.swf) is the same game with a 1000 px stage header.
-  // Online play shows the original 650 px view, so rewrite the stage width to 650 if it differs.
-  // Resolves with the bytes to load (unchanged when already 650 px or not readable).
-  var STAGE_W = 650 * 20;   // twips
-  function onlineStage(buf) {
-    var u = new Uint8Array(buf);
-    var body = u[0] === 0x46 ? Promise.resolve(u.subarray(8)) :
-      u[0] === 0x43 && window.DecompressionStream ?
-        new Response(new Blob([u.subarray(8)]).stream().pipeThrough(new DecompressionStream("deflate")))
-          .arrayBuffer().then(function (b) { return new Uint8Array(b); }) :
-        Promise.resolve(null);   // LZMA (ZWS) or no decompressor: leave it alone
-    return body.then(function (b) {
-      if (!b) return buf;
-      var n = b[0] >> 3, pos = 5;
-      function rd() {   // signed n-bit value
-        var v = 0;
-        for (var i = 0; i < n; i++, pos++) v = (v << 1) | ((b[pos >> 3] >> (7 - (pos & 7))) & 1);
-        return v >= 1 << (n - 1) ? v - (1 << n) : v;
-      }
-      var r = [rd(), rd(), rd(), rd()], rectLen = Math.ceil((5 + 4 * n) / 8);
-      if (r[1] - r[0] === STAGE_W) return buf;
-      r[1] = r[0] + STAGE_W;
-      var nb = 1;
-      r.forEach(function (v) { while (v >= 1 << (nb - 1) || v < -(1 << (nb - 1))) nb++; });
-      var bits = [];
-      for (var i = 4; i >= 0; i--) bits.push((nb >> i) & 1);
-      r.forEach(function (v) { for (var i = nb - 1; i >= 0; i--) bits.push((v >> i) & 1); });
-      var rect = new Uint8Array(Math.ceil(bits.length / 8));
-      bits.forEach(function (x, i) { if (x) rect[i >> 3] |= 0x80 >> (i & 7); });
-      var rest = b.subarray(rectLen), out = new Uint8Array(8 + rect.length + rest.length);
-      out.set([0x46, 0x57, 0x53, u[3]]);   // "FWS" + version, uncompressed
-      new DataView(out.buffer).setUint32(4, out.length, true);
-      out.set(rect, 8); out.set(rest, 8 + rect.length);
-      return out.buffer;
-    }).catch(function () { return buf; });
-  }
-
   var player = null, fromUser = false, readyTimer = null;
   // keep the original 650 x 450 shape whatever the window or device
   var RATIO = 650 / 450;
@@ -175,7 +139,7 @@
     if (q.get("dbg")) params.dbg = q.get("dbg");
     var opts = { parameters: params };
     if (src.url) { opts.url = src.url; player.ruffle().load(opts); return; }
-    onlineStage(src.data).then(function (b) { opts.data = new Uint8Array(b); player.ruffle().load(opts); });
+    AOWStage.width(src.data, 650).then(function (b) { opts.data = new Uint8Array(b); player.ruffle().load(opts); });
   }
   function useFile(f) {
     if (!f) return;
