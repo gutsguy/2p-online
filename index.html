@@ -62,7 +62,7 @@
   // connection method (see net.js): ?net=auto|webrtc|mqtt|local|relay, else last choice, else auto.
   // The relay lives in serve.py, so it is offered only when the page comes from serve.py (has a port).
   var ORDER = ["auto", "webrtc", "cf", "mqtt", "local", "relay"];
-  var KINDS = AOWNet.kinds().filter(function (k) { return k !== "relay" || location.port; })
+  var KINDS = AOWNet.kinds().filter(function (k) { return k !== "rejoin" && (k !== "relay" || location.port); })
     .sort(function (a, b) { return (ORDER.indexOf(a) + 99) % 99 - (ORDER.indexOf(b) + 99) % 99; });
   var KIND = q.get("net");
   try { KIND = KIND || localStorage.getItem("aow-net2"); } catch (e) {}
@@ -94,6 +94,13 @@
   function isSwf(buf) {
     var b = new Uint8Array(buf, 0, Math.min(3, buf.byteLength));
     return b.length === 3 && (b[0] === 0x46 || b[0] === 0x43 || b[0] === 0x5A) && b[1] === 0x57 && b[2] === 0x53;
+  }
+
+  // short fingerprint of the game file, so two different files are caught before playing
+  function tagOf(buf) {
+    var u = new Uint8Array(buf), h = 2166136261;
+    for (var i = 0; i < u.length; i++) { h ^= u[i]; h = Math.imul(h, 16777619); }
+    return (h >>> 0).toString(16) + "-" + u.length;
   }
 
   var player = null, fromUser = false, readyTimer = null;
@@ -138,7 +145,12 @@
     var params = { mode: "online" };
     if (q.get("dbg")) params.dbg = q.get("dbg");
     var opts = { parameters: params };
-    if (src.url) { opts.url = src.url; player.ruffle().load(opts); return; }
+    if (src.url) {
+      opts.url = src.url; player.ruffle().load(opts);
+      fetch(src.url).then(function (r) { return r.arrayBuffer(); }).then(function (b) { fileTag = tagOf(b); }).catch(function () {});
+      return;
+    }
+    fileTag = tagOf(src.data);
     AOWStage.width(src.data, 650).then(function (b) { opts.data = new Uint8Array(b); player.ruffle().load(opts); });
   }
   function useFile(f) {
@@ -165,9 +177,37 @@
 
   var swfReady = false, net = null, role = null, room = null, playing = false;
   var lastSeen = 0, pingTimer = null;
+  // PROTO: bump when the page <-> page messages change (both players need the same site version)
+  var PROTO = 2, SID = Math.random().toString(36).slice(2, 10), fileTag = "";
+  var guestSid = null;      // host: session id of the guest in the current game
+  var peerLeft = false;     // the other side said goodbye (page closed / reloaded)
+  // Game messages are numbered and kept until the other side confirms them (in its ping),
+  // so nothing is lost or doubled when the connection drops and comes back.
+  var outSeq = 0, outQ = [], inSeq = 0, held = {}, lastAsk = 0;
+  var rejoin = null;        // reconnect in progress: { since, timer }
+  var REJOIN_SEC = 120;
+
+  var hole = 0;             // testing (?dbg): messages are dropped both ways until this time
+  function sendRaw(t) { if (net && Date.now() >= hole) net.send(t); }
+  function resetSeq() { outSeq = 0; outQ = []; inSeq = 0; held = {}; }
+  function acked(n) { while (outQ.length && outQ[0][0] <= n) outQ.shift(); }
+  function resend(n) { outQ.forEach(function (m) { if (m[0] > n) sendRaw("g" + m[0] + "|" + m[1]); }); }
+  function askResend() { var t = Date.now(); if (t - lastAsk > 700) { lastAsk = t; sendRaw("Lr|" + inSeq); } }
+  function deliver(s) { if (playing) player.aowRecv(s); }
+  function onGame(t) {
+    var i = t.indexOf("|"), n = Number(t.slice(1, i)), s = t.slice(i + 1);
+    if (!(n > 0) || n <= inSeq) return;                      // duplicate
+    if (n > inSeq + 1) { held[n] = s; askResend(); return; } // a gap: keep it, ask for the missing ones
+    inSeq = n; deliver(s);
+    while (held[inSeq + 1] !== undefined) { var x = held[inSeq + 1]; delete held[inSeq + 1]; inSeq++; deliver(x); }
+  }
 
   // ---- SWF -> page ----
-  window.aowSend = function (s) { if (net) net.send("g" + s); };
+  window.aowSend = function (s) {
+    outSeq++; outQ.push([outSeq, s]);
+    if (outQ.length > 5000) outQ.shift();
+    if (!rejoin) sendRaw("g" + outSeq + "|" + s);
+  };
   window.aowEvent = function (e) {
     if (e === "ready") { swfReady = true; clearTimeout(readyTimer); if (!net) status("방을 만들거나 방 코드로 참가하세요."); return; }
     if (e.indexOf("end|") === 0) {
@@ -177,31 +217,126 @@
     }
   };
 
+  function pathText() {
+    var path = net && net.path ? net.path() : null;
+    return path === "direct" ? " · 직접 연결" : path ? " · 인터넷 중계" : "";
+  }
   function startGame() {
+    resetSeq(); peerLeft = false; stopRejoin();
     playing = true;
     $("again").hidden = true;
     var r = player.aowStart(role);
-    var path = net && net.path ? net.path() : null;
-    status((role === "H" ? "게임 시작 (방장)" : "게임 시작 (참가자)") +
-           (path === "direct" ? " · 직접 연결" : path && path !== "direct" ? " · 인터넷 중계" : ""), "ok");
+    status((role === "H" ? "게임 시작 (방장)" : "게임 시작 (참가자)") + pathText(), "ok");
     player.focus();
     return r;
   }
 
   var started = false, helloTimer = null, giveUpTimer = null;
+  function hello() { sendRaw("Lhello|" + SID + "|" + PROTO + "|" + fileTag); }
   function onLobby(t) {
-    if (t === "hello" && role === "H") { if (!playing) { net.send("Lstart"); startGame(); } }
-    else if (t === "start" && role === "G") { started = true; clearInterval(helloTimer); clearTimeout(giveUpTimer); startGame(); }
-    else if (t === "bye") { status("상대가 나갔습니다.", "err"); playing = false; }
+    var a = t.split("|"), k = a[0];
+    if (k === "p") { acked(Number(a[1]) || 0); return; }
+    if (k === "r") { var n = Number(a[1]) || 0; acked(n); resend(n); return; }
+    if (k === "ping" || (k === "hello" && a.length < 4)) {   // the other page is an older version
+      status("상대의 사이트가 옛날 버전입니다. 상대에게 새로고침(Ctrl+F5)을 부탁하세요.", "err");
+      return;
+    }
+    if (k === "hello" && role === "H") {
+      if (Number(a[2]) !== PROTO) { sendRaw("Lbad|proto"); status("상대의 사이트 버전이 다릅니다. 두 사람 모두 새로고침(Ctrl+F5) 해 주세요.", "err"); return; }
+      if (a[3] !== fileTag) { sendRaw("Lbad|file"); status("두 사람의 게임 파일이 다릅니다. 같은 파일을 골라야 합니다.", "err"); return; }
+      if (playing && a[1] === guestSid) return;    // repeated hello from the guest already in this game
+      guestSid = a[1];                              // a new guest (or the same one after reloading): new game
+      sendRaw("Lstart"); startGame();
+    }
+    else if (k === "start" && role === "G") { started = true; clearInterval(helloTimer); clearTimeout(giveUpTimer); startGame(); }
+    else if (k === "bad" && role === "G") {
+      clearInterval(helloTimer); clearTimeout(giveUpTimer);
+      closeNet();
+      status(a[1] === "file" ? "방장과 게임 파일이 다릅니다. 같은 파일을 골라 주세요." :
+             "방장과 사이트 버전이 다릅니다. 두 사람 모두 새로고침(Ctrl+F5) 해 주세요.", "err");
+      unlock();
+    }
+    else if (k === "bye") {
+      peerLeft = true; playing = false; stopRejoin();
+      if (role === "H") status("상대가 나갔습니다. 같은 방 코드로 다시 참가하면 새 게임이 시작됩니다.", "err");
+      else { closeNet(); status("방장이 나갔습니다. 방장이 방을 다시 만들면 그 코드로 참가하세요.", "err"); unlock(); }
+    }
   }
   function unlock() {
     $("host").disabled = $("join").disabled = $("code").disabled = $("kind").disabled = $("pick").disabled = false;
   }
+  function closeNet() { var n = net; net = null; if (n) try { n.close(); } catch (e) {} }
+
+  // ---- reconnect after a drop during a game ----
+  // Both sides notice (connection closed, or nothing heard for a while) and meet again on the
+  // internet relay with the same room code; the games keep running meanwhile.
+  function rekind() { return KIND === "local" || KIND === "relay" ? KIND : "rejoin"; }
+  function startRejoin() {
+    if (rejoin) return;
+    rejoin = { since: Date.now(), timer: null };
+    tryRejoin();
+  }
+  function tryRejoin() {
+    if (!rejoin) return;
+    var left = REJOIN_SEC - Math.round((Date.now() - rejoin.since) / 1000);
+    if (left <= 0) {
+      stopRejoin(); closeNet(); playing = false;
+      status("다시 연결하지 못했습니다. 방을 새로 만들거나 다시 참가해 주세요.", "err");
+      unlock();
+      return;
+    }
+    status("연결이 끊겼습니다. 다시 연결하는 중... (" + left + "초 남음)", "err");
+    closeNet();
+    net = openNet(rekind());
+    rejoin.timer = setTimeout(tryRejoin, 15000);
+  }
+  function stopRejoin() { if (rejoin) { clearTimeout(rejoin.timer); rejoin = null; } }
+
+  function openNet(kind) {
+    var me = AOWNet.create(kind, room, role, {
+      onOpen: function () {
+        if (net !== me) return;
+        lastSeen = Date.now();
+        if (rejoin) { sendRaw("Lr|" + inSeq); return; }
+        if (role === "H") { if (!playing) status("방 코드: " + room + "  — 상대가 참가하기를 기다리는 중...", "ok"); }
+        else if (!started) {
+          status("방 " + room + " 에 참가하는 중...");
+          // repeat until the host answers (it may still be getting ready)
+          hello();
+          clearInterval(helloTimer);
+          helloTimer = setInterval(function () { if (!started && net) hello(); }, 2000);
+        }
+      },
+      onMessage: function (t) {
+        if (net !== me || Date.now() < hole) return;
+        lastSeen = Date.now();
+        if (rejoin && playing) {
+          stopRejoin();
+          sendRaw("Lr|" + inSeq);
+          status("다시 연결됐습니다" + pathText(), "ok");
+        }
+        if (t.charAt(0) === "g") onGame(t);
+        else if (t.charAt(0) === "L") onLobby(t.slice(1));
+      },
+      onClose: function () {
+        if (net !== me) return;
+        if (playing && !peerLeft) { startRejoin(); return; }
+        if (rejoin) return;
+        // keep the room open for the guest (relays only: the old direct-connection id may still be taken)
+        if (role === "H") { closeNet(); net = openNet(rekind()); return; }
+        closeNet();
+        if (!peerLeft) status("연결이 끊겼습니다.", "err");
+        unlock();
+      },
+      onStatus: function (t, cls) { if (net === me && !rejoin) status(t, cls); }
+    });
+    return me;
+  }
 
   function connect(asRole, code) {
     if (!swfReady) { status(player ? "아직 게임을 불러오는 중입니다." : "먼저 게임 파일을 선택하세요.", "err"); return; }
-    if (net) net.close();
-    role = asRole; room = code; started = false;
+    closeNet(); stopRejoin();
+    role = asRole; room = code; started = false; playing = false; peerLeft = false; guestSid = null;
     clearInterval(helloTimer); clearTimeout(giveUpTimer);
     $("host").disabled = $("join").disabled = true; $("code").disabled = true; $("kind").disabled = true;
     $("pick").disabled = true;
@@ -211,38 +346,21 @@
       // guest: give up (and let the player try again) if the game has not started in time
       giveUpTimer = setTimeout(function () {
         if (started) return;
-        clearInterval(helloTimer); clearInterval(pingTimer);
-        if (net) { net.close(); net = null; }
+        clearInterval(helloTimer);
+        closeNet();
         status("방 " + room + " 에 연결하지 못했습니다. 방 코드를 확인하고 다시 참가해 보세요.", "err");
         unlock();
       }, 30000);
     }
-    net = AOWNet.create(KIND, room, role, {
-      onOpen: function () {
-        lastSeen = Date.now();
-        if (role === "H") status("방 코드: " + room + "  — 상대가 참가하기를 기다리는 중...", "ok");
-        else {
-          status("방 " + room + " 에 참가하는 중...");
-          // repeat until the host answers (it may still be getting ready)
-          net.send("Lhello");
-          clearInterval(helloTimer);
-          helloTimer = setInterval(function () { if (!started && net) net.send("Lhello"); }, 2000);
-        }
-        clearInterval(pingTimer);
-        pingTimer = setInterval(function () {
-          if (!net) return;
-          net.send("Lping");
-          if (playing && Date.now() - lastSeen > 6000) status("상대와 연결이 끊긴 것 같습니다...", "err");
-        }, 1000);
-      },
-      onMessage: function (t) {
-        lastSeen = Date.now();
-        if (t.charAt(0) === "g") { if (playing) player.aowRecv(t.slice(1)); }
-        else if (t.charAt(0) === "L") onLobby(t.slice(1));
-      },
-      onClose: function () { status("연결이 끊겼습니다.", "err"); playing = false; },
-      onStatus: function (t, cls) { status(t, cls); }
-    });
+    net = openNet(KIND);
+    lastSeen = Date.now();
+    clearInterval(pingTimer);
+    pingTimer = setInterval(function () {
+      if (!net) return;
+      if (rejoin) { sendRaw("Lr|" + inSeq); return; }
+      sendRaw("Lp|" + inSeq);   // also confirms the game messages received so far
+      if (playing && !peerLeft && Date.now() - lastSeen > 8000) startRejoin();
+    }, 1000);
   }
 
   function newCode() {
@@ -266,7 +384,13 @@
     connect("G", c);
   };
   $("code").onkeydown = function (e) { if (e.key === "Enter") $("join").click(); };
-  $("again").onclick = function () { if (net && role === "H") { net.send("Lstart"); startGame(); } };
+  $("again").onclick = function () { if (net && role === "H" && !peerLeft) { net.send("Lstart"); startGame(); } };
+  // testing aid (?dbg=1): cut the connection silently for ms, or close it
+  if (q.get("dbg")) window.aowTest = {
+    blackhole: function (ms) { hole = Date.now() + ms; },
+    drop: function () { var n = net; if (n) n.close(); if (n && n === net) setTimeout(function () { if (net === n && playing) startRejoin(); }, 0); },
+    state: function () { return { playing: playing, rejoin: !!rejoin, outQ: outQ.length, inSeq: inSeq, outSeq: outSeq, path: net && net.path ? net.path() : null }; }
+  };
   window.addEventListener("beforeunload", function () { if (net) net.send("Lbye"); });
 })();
 </script>

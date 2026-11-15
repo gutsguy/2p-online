@@ -104,7 +104,11 @@
                   "연결 오류: " + (e.type || e);
         h.onStatus && h.onStatus(msg, "err");
       });
-      peer.on("disconnected", function () { if (!closed && !conn) h.onStatus && h.onStatus("중개 서버와 연결이 끊겼습니다.", "err"); });
+      // lost the broker (network blip, laptop sleep): register again so the room stays findable
+      peer.on("disconnected", function () {
+        if (closed) return;
+        setTimeout(function () { if (!closed && peer && peer.disconnected && !peer.destroyed) try { peer.reconnect(); } catch (e) {} }, 1000);
+      });
     });
     return {
       send: function (text) {
@@ -234,8 +238,14 @@
   var FALLBACK_MS = 8000;
   var KIND = { direct: "webrtc", cf: "cf", mqtt: "mqtt" };
   TRANSPORTS.auto = function (room, role, h) {
+    return chained(cfUrl() ? ["direct", "cf", "mqtt"] : ["direct", "mqtt"], room, role, h);
+  };
+  // rejoin: used by the page to reconnect during a game; relays only (no new direct handshake)
+  TRANSPORTS.rejoin = function (room, role, h) {
+    return chained(cfUrl() ? ["cf", "mqtt"] : ["mqtt"], room, role, h);
+  };
+  function chained(chain, room, role, h) {
     var paths = {}, tried = {}, active = null, closed = false, opened = false, timer = null;
-    var chain = cfUrl() ? ["direct", "cf", "mqtt"] : ["direct", "mqtt"];
     function choose(name) {
       if (active) return;
       active = name;
@@ -287,7 +297,8 @@
       });
     }
     if (role === "H") chain.forEach(start);
-    else { start("direct"); timer = setTimeout(function () { next("direct"); }, FALLBACK_MS); }
+    else if (chain[0] === "direct") { start("direct"); timer = setTimeout(function () { next("direct"); }, FALLBACK_MS); }
+    else start(chain[0]);
     return {
       send: function (text) {
         if (active) { paths[active] && paths[active].send(text); return; }
@@ -299,7 +310,7 @@
       },
       path: function () { return active; }
     };
-  };
+  }
 
   window.AOWNet = {
     kinds: function () { return Object.keys(TRANSPORTS); },
