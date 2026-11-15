@@ -10,14 +10,19 @@
 //             from the local folder or from the deployed site (make_site.py).
 //    relay  : WebSocket relay in serve.py on the host's PC; the friend opens
 //             the host's address (e.g. over Tailscale).
+//    cf     : our own relay on Cloudflare Workers (relay-cf/); passes
+//             networks where direct connection is blocked.
 //    mqtt   : messages go through a free public MQTT broker over secure
-//             WebSocket; passes networks where direct connection is blocked.
+//             WebSocket; spare relay if the Cloudflare one is unreachable.
 //    auto   : webrtc first; if the direct connection does not open within a
-//             few seconds, the guest switches to mqtt. The host listens on
-//             both and uses whichever the guest's first message arrives on.
+//             few seconds, the guest switches to cf, and to mqtt if cf fails.
+//             The host listens on all of them and uses whichever the guest's
+//             first message arrives on.
 //
-//  Testing aid: ?nodirect=1 makes WebRTC unable to connect (relay-only ICE
+//  Testing aids: ?nodirect=1 makes WebRTC unable to connect (relay-only ICE
 //  with no TURN server), like a network that blocks direct connections.
+//  ?nocf=1 skips the Cloudflare relay; ?cf=ws://127.0.0.1:18780 uses a local
+//  relay (npm run dev in relay-cf/).
 // =====================================================================
 (function () {
   var TRANSPORTS = {};
@@ -136,6 +141,42 @@
   };
   function RELAY_PORT() { return Number(location.port || 80) + 1; }
 
+  // --- cf: our relay on Cloudflare Workers (relay-cf/) -----------------------
+  // Set after deploying relay-cf ("npm run deploy" prints the address).
+  var CF_RELAY = "wss://aow-2p-relay.gutsguy.workers.dev";
+  function cfUrl() {
+    var qp = new URLSearchParams(location.search);
+    if (qp.has("nocf")) return "";
+    return (qp.get("cf") || CF_RELAY).replace(/^http/, "ws").replace(/\/$/, "");
+  }
+  LABELS.cf = "인터넷 중계 (Cloudflare)";
+  TRANSPORTS.cf = function (room, role, h) {
+    var base = cfUrl(), ws = null, closed = false, open = false, queue = [];
+    function fail(msg) { if (!closed) { closed = true; h.onStatus && h.onStatus(msg, "err"); } }
+    if (!base) setTimeout(function () { fail("Cloudflare 중계 주소가 설정되지 않았습니다."); }, 0);
+    else {
+      ws = new WebSocket(base + "/r/" + room + "/" + role);
+      var t = setTimeout(function () { if (!open) { try { ws.close(); } catch (e) {} fail("Cloudflare 중계 서버가 응답하지 않습니다."); } }, 8000);
+      ws.onopen = function () {
+        if (closed) return;
+        open = true; clearTimeout(t);
+        h.onOpen();
+        queue.forEach(function (m) { ws.send(m); }); queue = [];
+      };
+      ws.onmessage = function (e) { if (!closed) h.onMessage(String(e.data)); };
+      ws.onerror = function () { if (!open) { clearTimeout(t); fail("Cloudflare 중계 서버에 연결할 수 없습니다."); } };
+      ws.onclose = function () {
+        clearTimeout(t);
+        if (!open) fail("Cloudflare 중계 서버에 연결할 수 없습니다.");
+        else if (!closed) { closed = true; h.onClose(); }
+      };
+    }
+    return {
+      send: function (text) { if (open && ws.readyState === 1) ws.send(text); else if (!open) queue.push(text); },
+      close: function () { closed = true; try { ws && ws.close(); } catch (e) {} }
+    };
+  };
+
   // --- mqtt: free public broker over secure WebSocket ------------------------
   LABELS.mqtt = "인터넷 중계 (공개 MQTT 서버)";
   var MQTT_URL = "https://unpkg.com/mqtt@5.10.1/dist/mqtt.min.js";
@@ -188,20 +229,34 @@
     };
   };
 
-  // --- auto: direct (webrtc) first, internet relay (mqtt) as fallback --------
+  // --- auto: direct (webrtc) first, then our relay (cf), then public mqtt ------
   LABELS.auto = "자동 (직접 연결, 안 되면 인터넷 중계)";
   var FALLBACK_MS = 8000;
+  var KIND = { direct: "webrtc", cf: "cf", mqtt: "mqtt" };
   TRANSPORTS.auto = function (room, role, h) {
-    var paths = {}, active = null, closed = false, opened = false, timer = null;
+    var paths = {}, tried = {}, active = null, closed = false, opened = false, timer = null;
+    var chain = cfUrl() ? ["direct", "cf", "mqtt"] : ["direct", "mqtt"];
     function choose(name) {
       if (active) return;
       active = name;
       Object.keys(paths).forEach(function (k) { if (k !== name) { paths[k].close(); delete paths[k]; } });
       h.onStatus && h.onStatus(name === "direct" ? "직접 연결됨" : "인터넷 중계로 연결됨", "ok");
     }
+    // guest: give up on path `name` and try the next one in the chain
+    function next(name) {
+      if (closed || active || role !== "G") return;
+      if (paths[name]) { paths[name].close(); delete paths[name]; }
+      var i = chain.indexOf(name) + 1;
+      while (i < chain.length && tried[chain[i]]) i++;
+      if (i >= chain.length) { h.onStatus && h.onStatus("연결할 수 있는 방법을 찾지 못했습니다.", "err"); return; }
+      clearTimeout(timer);
+      h.onStatus && h.onStatus(name === "direct" ? "직접 연결이 안 돼서 인터넷 중계로 연결하는 중..." :
+                               "다른 인터넷 중계로 연결하는 중...");
+      start(chain[i]);
+    }
     function start(name) {
-      var kind = name === "direct" ? "webrtc" : "mqtt";
-      paths[name] = TRANSPORTS[kind](room, role, {
+      tried[name] = true;
+      paths[name] = TRANSPORTS[KIND[name]](room, role, {
         onOpen: function () {
           if (closed || !paths[name]) return;
           if (role === "G") { clearTimeout(timer); choose(name); }
@@ -216,27 +271,23 @@
         onClose: function () {
           if (closed) return;
           if (active === name) h.onClose();
-          else if (role === "G" && name === "direct" && !active) fallback();
+          else if (!active) next(name);
         },
         onStatus: function (t, cls) {
           if (closed || !paths[name]) return;
           if (active && active !== name) return;
-          if (!active && name === "direct" && cls === "err") { if (role === "G") fallback(); return; }
+          if (!active && cls === "err") {
+            if (role === "G") next(name);
+            else if (name !== "direct") { paths[name].close(); delete paths[name]; }   // host keeps the others
+            if (role === "G" || name !== "direct") return;
+          }
           if (!active && role === "H" && cls !== "err") return;   // the page shows the room code itself
           h.onStatus && h.onStatus(t, cls);
         }
       });
     }
-    function fallback() {
-      if (closed || active || paths.relay) return;
-      clearTimeout(timer);
-      if (paths.direct) { paths.direct.close(); delete paths.direct; }
-      h.onStatus && h.onStatus("직접 연결이 안 돼서 인터넷 중계로 연결하는 중...");
-      start("relay");
-    }
-    start("direct");
-    if (role === "H") start("relay");
-    else timer = setTimeout(fallback, FALLBACK_MS);
+    if (role === "H") chain.forEach(start);
+    else { start("direct"); timer = setTimeout(function () { next("direct"); }, FALLBACK_MS); }
     return {
       send: function (text) {
         if (active) { paths[active] && paths[active].send(text); return; }

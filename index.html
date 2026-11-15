@@ -61,7 +61,7 @@
   var BUNDLED = "age-of-war-online.swf";   // present in the local folder, absent on the web site
   // connection method (see net.js): ?net=auto|webrtc|mqtt|local|relay, else last choice, else auto.
   // The relay lives in serve.py, so it is offered only when the page comes from serve.py (has a port).
-  var ORDER = ["auto", "webrtc", "mqtt", "local", "relay"];
+  var ORDER = ["auto", "webrtc", "cf", "mqtt", "local", "relay"];
   var KINDS = AOWNet.kinds().filter(function (k) { return k !== "relay" || location.port; })
     .sort(function (a, b) { return (ORDER.indexOf(a) + 99) % 99 - (ORDER.indexOf(b) + 99) % 99; });
   var KIND = q.get("net");
@@ -183,7 +183,7 @@
     var r = player.aowStart(role);
     var path = net && net.path ? net.path() : null;
     status((role === "H" ? "게임 시작 (방장)" : "게임 시작 (참가자)") +
-           (path === "direct" ? " · 직접 연결" : path === "relay" ? " · 인터넷 중계" : ""), "ok");
+           (path === "direct" ? " · 직접 연결" : path && path !== "direct" ? " · 인터넷 중계" : ""), "ok");
     player.focus();
     return r;
   }
@@ -211,7 +211,7 @@
       // guest: give up (and let the player try again) if the game has not started in time
       giveUpTimer = setTimeout(function () {
         if (started) return;
-        clearInterval(helloTimer);
+        clearInterval(helloTimer); clearInterval(pingTimer);
         if (net) { net.close(); net = null; }
         status("방 " + room + " 에 연결하지 못했습니다. 방 코드를 확인하고 다시 참가해 보세요.", "err");
         unlock();
@@ -230,6 +230,7 @@
         }
         clearInterval(pingTimer);
         pingTimer = setInterval(function () {
+          if (!net) return;
           net.send("Lping");
           if (playing && Date.now() - lastSeen > 6000) status("상대와 연결이 끊긴 것 같습니다...", "err");
         }, 1000);
